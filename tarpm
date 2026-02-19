@@ -1,0 +1,271 @@
+#!/usr/bin/perl
+use warnings ;
+use strict ;
+
+use Pod::Usage ;
+use Data::Dumper ;
+use Getopt::Long qw(:config gnu_getopt) ;
+
+my $err = 0 ;
+my $man = 0 ;
+my $help = 0 ;
+my $debug = 0 ;
+my $verbose = 0 ;
+
+my $rpmdir = "." ;
+my $buildroot = undef ;
+
+my $specfile = undef ;
+
+GetOptions (
+  'man' => \$man,
+  'help|?' => \$help,
+  'd|debug+' => \$debug,
+  'v|verbose+' => \$verbose,
+  'q|quiet' => sub { $verbose = -1 },
+
+  'R|rpmdir=s' => \$rpmdir,
+  'B|buildroot=s' => \$buildroot,
+  ) or $err++ ;
+
+if (@ARGV == 1) { $specfile = shift @ARGV ; } else { $err++ }
+
+pod2usage (-exitstatus=>0, -verbose=>2) if $man ;
+pod2usage (-exitstatus=>1, -verbose=>1) if $help ;
+pod2usage (-exitstatus=>2, -verbose=>0) if $err ;
+
+use POSIX qw ( strftime ) ;
+my $timestamp = strftime "%Y%m%d.%H%M%S", localtime ;
+
+die "Buildroot must be defined!\n" unless $buildroot ;
+$buildroot =~ s|^|$ENV{PWD}/| unless $buildroot =~ m|^/| ;
+die "Buildroot must already exist!\n" unless -d  $buildroot ;
+
+# --- 
+
+open SPEC, '<', $specfile
+  or die "Cannot open $specfile: $!\n" ;
+my ($basename) = $specfile =~ m|([^/]*?)(.spec)?$| ;
+
+my $section = {
+  ( map {$_=>{is_list=>1}} qw {
+      tags files tarfiles description }),
+  ( map {$_=>{is_script=>1}} qw {
+      pre post preun postun pretrans posttrans
+      triggerin triggerun triggerprein triggerpostun }),
+  ( map {$_=>{is_unsupported=>1}} qw {
+      prep build install check clean verifyscript
+      package changelog sepolicy })
+  } ;
+
+foreach my $s ( keys %$section ) { $section->{$s}{name} = $s ; }
+
+my $sec = $section->{'tags'} ;
+
+while (<SPEC>)
+  {
+  chomp ;
+  next if /^\s*$/ or /^\s*#/ ;
+  last if /^%__END__/ ; # bail out
+  if (/^%(\w+)\b\s*/ and $section->{$1})
+    {
+    $sec = $section->{$1} ;
+    die "tarpm: %$1 unsupported\n" if $sec->{is_unsupported} ;
+    die "tarpm: %$1 arguments disallowed\n" if $sec->{is_list} and $' ;
+    die "tarpm: %$1 interpreters unsupported\n" if $sec->{is_script} and $' ;
+    }
+  else
+    {
+    push @{$sec->{text}}, $_ ;
+    }
+  }
+
+# --- 
+
+my $tag = {} ;
+
+push @{$tag->{'Requires(post)'}}, "tar" ;
+push @{$tag->{'Requires(preun)'}}, "tar" ; # Actually, for verify...
+
+foreach (@{$section->{tags}{text}})
+  {
+  if (/^Name:\s*(\S+)\s+(\S+)\s*$/)	{ push @{$tag->{Name}}, $1 ;
+ 					  push @{$tag->{Version}}, $2 ; }
+  elsif (/^([\w()]+):\s*(.*?)\s*$/)	{ push @{$tag->{$1}},  $2 ; }
+  else					{ die "Bad tagline: $_\n" ; }
+  }
+
+push @{$tag->{Name}},    $basename	if !defined $tag->{Name} ;
+push @{$tag->{Version}}, "1.0"		if !defined $tag->{Version} ;
+push @{$tag->{Release}}, $timestamp	if !defined $tag->{Release} ;
+push @{$tag->{License}}, 'unspecified'	if !defined $tag->{License} ;
+push @{$tag->{Summary}}, 'unspecified'	if !defined $tag->{Summary} ;
+
+my $name    = ${$tag->{Name}}[0] ;
+my $version = ${$tag->{Version}}[0] ;
+my $release = ${$tag->{Release}}[0] ;
+
+$name    =~ /^[-\w]+$/ or die "Illegal package name: $name\n" ;
+$version =~ /^[.\w]+$/ or die "Illegal version: $version\n" ;
+$release =~ /^[.\w]+$/ or die "Illegal release: $release\n" ;
+
+# --- 
+
+## tar ownerships on install???
+
+use File::Path ;
+
+if ($section->{tarfiles}{text})
+  {
+  my $tarlist		= "/var/tmp/tarpm.$$.list" ;
+  my $tarpmdir		= "/var/local/tarpms" ;
+  my $tarpmfile		= "$tarpmdir/$name-$version-$release.tgz" ;
+  my $buildtarpmdir	= "$buildroot/$tarpmdir" ;
+  my $buildtarpmfile	= "$buildroot/$tarpmfile" ;
+
+  -d $buildtarpmdir or mkpath $buildtarpmdir
+    or die "Cannot make directory $buildtarpmdir: $!\n" ;
+
+  open  LIST, ">", $tarlist or die "Cannot open $tarlist: $!\n" ;
+  END { unlink $tarlist if defined $tarlist ; }
+
+  foreach my $file (@{$section->{tarfiles}{text}})
+    {
+    if ($file =~ s|^\s*/+||) { print LIST $file, "\n" ; } # remove leading slash
+    else { die "tarpm: FATAL! non-absolute path for tarfile member:\n$file\n" }
+    }
+  close LIST ;
+
+  my @tarcmd = ( '/bin/tar', '-C', $buildroot,
+    '-czf', $buildtarpmfile, '-T', $tarlist ) ;
+  system (@tarcmd) == 0 or exit (1) ;  ## check for command success???
+
+  unshift @{$section->{files}{text}},	     "$tarpmfile" ;
+  unshift @{$section->{post}{text}},	     "tar -C/ -xzf $tarpmfile" ;
+  unshift @{$section->{verifyscript}{text}}, "tar -C/ -dzf $tarpmfile || : " ;
+  }
+$section->{tarfiles}{done} = 1 ;
+
+# --- 
+
+my $rpmspec = "/var/tmp/tarpm.$$.spec" ;
+open RPMSPEC, ">", $rpmspec or die "Cannot open $rpmspec: $!\n" ;
+END { unlink $rpmspec if defined $rpmspec ; }
+
+print RPMSPEC <<EOD ;
+%global _rpmdir $rpmdir
+%global	_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm
+AutoReqProv: no
+%global __check_files %{nil}
+%global __os_install_post %{nil}
+%global __spec_clean_cmd '/bin/true'
+##
+## backwards compatibility w/ CentOS7
+%global _binary_payload w2.xzdio
+EOD
+
+print RPMSPEC "Name:    ${$tag->{Name}}[0]\n" ;    delete $tag->{Name} ;
+print RPMSPEC "Version: ${$tag->{Version}}[0]\n" ; delete $tag->{Version} ;
+print RPMSPEC "Release: ${$tag->{Release}}[0]\n" ; delete $tag->{Release} ;
+print RPMSPEC "License: ${$tag->{License}}[0]\n" ; delete $tag->{License} ;
+print RPMSPEC "Summary: ${$tag->{Summary}}[0]\n" ; delete $tag->{Summary} ;
+
+while (my ($t, $text) = each %$tag)
+  {
+  foreach (@$text) { print RPMSPEC "$t: $_\n" ; }
+  }
+$section->{tags}{done} = 1 ;
+
+$section->{files}{text} //= [ '' ] ;
+$section->{description}{text} //= [ 'unspecified' ] ;
+
+foreach my $s (qw( description files verifyscript ), keys %$section)
+  {
+  my $sec = $section->{$s} ;
+  next unless $sec->{text} and not $sec->{done} ;
+  print RPMSPEC "\n%$s\n" ;
+  print RPMSPEC "$_\n" foreach @{$sec->{text}} ;
+  $sec->{done} = 1 ;
+  }
+
+close RPMSPEC or die "Error closing $rpmspec: $!\n" ;
+
+if ($debug)
+  {
+  open RPMSPEC, "<", $rpmspec or die "Cannot open $rpmspec: $!\n" ;
+  print "==========\n" ;
+  while (<RPMSPEC>) { print $_ ; }
+  print "==========\n" ;
+  exit 0 ;
+  }
+
+my @cmd = ( qw(/usr/bin/rpmbuild -bb --buildroot), $buildroot, $rpmspec) ;
+system (@cmd) == 0 or exit (1) ; ## check for command success???
+
+__END__ # =====================================================================
+
+=head1 NAME
+
+tarpm - build tarpm archives
+
+=head1 SYNOPSIS
+
+tarpm [options] spec-file
+
+=head1 DESCRIPTION
+
+B<tarpm> will ...
+
+=head1 OPTIONS
+
+B<tarpm> supports the following command-line options:
+
+=over 8
+
+=item B<--help>
+
+Prints a brief help message and exits.
+
+=item B<--man>
+
+Prints the manual page and exits.
+
+=item B<-d, --debug>
+
+Increases the debug level.
+
+=item B<-R, --rpmdir> I<directory>
+
+Specifies the directory in which to write the new rpm file.
+Defaults to the current directory.
+
+=item B<-B, --buildroot> I<directory>
+
+Specifies a 'BuildRoot' directory
+from which to gather the files going into the rpm.
+
+=back
+
+=head1 NOTES
+
+If unspecified, tarpm will fill the Name, Version, and Release
+tags with the basename of the specfile, 1.0, and a timestamp,
+respectively.
+
+=head1 SPEC-FILE EXAMPLE
+
+An example spec-file:
+
+  Name: phys-test
+  Version: 0.9
+
+  %files
+  /etc/amd.conf
+  /etc/amd.host
+  /etc/csh.cshrc
+
+
+=head1 AUTHOR
+
+WRSomsky <somsky@uw.edu>
+
